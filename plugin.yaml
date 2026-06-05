@@ -1,0 +1,39 @@
+name: wecom_stream
+label: WeCom Stream
+kind: platform
+version: 1.0.0
+description: >
+  WeCom (Enterprise WeChat) streaming adapter for Hermes Agent.
+  Uses the official wecom-aibot-python-sdk with reply_stream for
+  real-time "Thinking..." indicators and progressive text streaming.
+  Reuses the same WECOM_BOT_ID / WECOM_SECRET as the built-in wecom
+  adapter — just enable this platform and disable wecom to switch.
+author: Hermes Agent contributors
+requires_env:
+  - name: WECOM_BOT_ID
+    description: "WeCom AI Bot ID"
+    prompt: "WeCom Bot ID"
+    url: "https://work.weixin.qq.com/wework_admin/frame"
+    password: true
+  - name: WECOM_SECRET
+    description: "WeCom AI Bot Secret"
+    prompt: "WeCom Bot Secret"
+    url: "https://work.weixin.qq.com/wework_admin/frame"
+    password: true
+optional_env:
+  - name: WECOM_WEBSOCKET_URL
+    description: "WebSocket URL (default: wss://openws.work.weixin.qq.com)"
+    prompt: "WebSocket URL (or empty for default)"
+    password: false
+  - name: WECOM_ALLOWED_USERS
+    description: "Comma-separated user IDs allowed to DM the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: WECOM_HOME_CHANNEL
+    description: "Default chat ID for cron / notification delivery"
+    prompt: "Home channel ID (or empty)"
+    password: false
+  - name: WECOM_HOME_CHANNEL_NAME
+    description: "Display name for the home channel"
+    prompt: "Home channel display name"
+    password: false
