@@ -40,6 +40,118 @@ from gateway.platforms.helpers import MessageDeduplicator
 
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------------
+# Monkey-patch aibot WsConnectionManager reconnection strategy
+#
+# SDK 默认指数退避 (1s→2s→4s...封顶30s)，且 connect() 失败时
+# on_error 经 pyee re-raise 异常，会杀死整个 _receive_loop task，
+# 导致后续重连永远不执行。
+#
+# 覆盖为三阶段策略 + 异常隔离：
+#   第 1-3 次: 1s   (快速恢复)
+#   第 4-6 次: 60s  (等待网络恢复)
+#   第 7+ 次:  300s (持续重试直到成功)
+# ------------------------------------------------------------------
+
+if AIBOT_AVAILABLE:
+    import ssl as _ssl
+    import websockets as _websockets
+
+    try:
+        import certifi as _certifi
+        _PATCH_SSL_CTX = _ssl.create_default_context(cafile=_certifi.where())
+    except ImportError:
+        _PATCH_SSL_CTX = _ssl.create_default_context()
+
+    from aibot.ws import WsConnectionManager as _WsMgr
+
+    def _get_reconnect_delay(self, attempt: int) -> int:  # type: ignore[no-untyped-def]
+        """三阶段重连延迟 (ms)"""
+        if attempt <= 3:
+            return 1000
+        elif attempt <= 6:
+            return 60000
+        else:
+            return 300000
+
+    async def _patched_schedule_reconnect(self) -> None:  # type: ignore[no-untyped-def]
+        """覆盖 SDK 的 _schedule_reconnect：三阶段延迟 + 异常隔离"""
+        if (
+            self._max_reconnect_attempts != -1
+            and self._reconnect_attempts >= self._max_reconnect_attempts
+        ):
+            self._logger.error(
+                f"Max reconnect attempts reached ({self._max_reconnect_attempts}), giving up"
+            )
+            try:
+                if self.on_error:
+                    self.on_error(Exception("Max reconnect attempts exceeded"))
+            except Exception:
+                pass
+            return
+
+        self._reconnect_attempts += 1
+        delay = _get_reconnect_delay(self, self._reconnect_attempts)
+
+        phase = (
+            "fast" if self._reconnect_attempts <= 3
+            else "medium" if self._reconnect_attempts <= 6
+            else "slow"
+        )
+        self._logger.info(
+            f"Reconnecting in {delay}ms [{phase}] (attempt {self._reconnect_attempts})..."
+        )
+        try:
+            if self.on_reconnecting:
+                self.on_reconnecting(self._reconnect_attempts)
+        except Exception:
+            pass
+
+        await asyncio.sleep(delay / 1000)
+        if self._is_manual_close:
+            return
+
+        try:
+            await self.connect()
+        except Exception as e:
+            self._logger.error(
+                f"Reconnect attempt {self._reconnect_attempts} raised: {e}"
+            )
+
+    async def _patched_connect(self) -> None:  # type: ignore[no-untyped-def]
+        """覆盖 SDK 的 connect：隔离 on_error 防止 pyee re-raise 杀死重连链"""
+        self._is_manual_close = False
+        await self._cleanup_ws()
+        self._logger.info(f"Connecting to WebSocket: {self._ws_url}...")
+        try:
+            self._ws = await _websockets.connect(
+                self._ws_url,
+                ssl=_PATCH_SSL_CTX,
+                ping_interval=None,
+                ping_timeout=None,
+                close_timeout=5,
+            )
+            self._reconnect_attempts = 0
+            self._missed_pong_count = 0
+            self._logger.info("WebSocket connection established, sending auth...")
+            if self.on_connected:
+                self.on_connected()
+            await self._send_auth()
+            self._receive_task = asyncio.ensure_future(self._receive_loop())
+        except Exception as e:
+            self._logger.error(f"Failed to create WebSocket connection: {e}")
+            try:
+                if self.on_error:
+                    self.on_error(e)
+            except Exception:
+                pass
+            await self._schedule_reconnect()
+
+    _WsMgr._get_reconnect_delay = _get_reconnect_delay
+    _WsMgr._schedule_reconnect = _patched_schedule_reconnect
+    _WsMgr.connect = _patched_connect
+    logger.info("[Wecom_Stream] Patched aibot reconnection strategy: 3-phase (1s/60s/300s)")
+
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
 MAX_MESSAGE_LENGTH = 4000
 DEDUP_MAX_SIZE = 1000
