@@ -178,6 +178,11 @@ _MEDIA_MSGTYPE: Dict[str, str] = {
 }
 
 
+def _ipc_socket_path() -> Path:
+    """Path to the Unix socket used for IPC relay."""
+    return Path(os.path.expanduser("~/.hermes/wecom_stream.sock"))
+
+
 def check_wecom_stream_requirements() -> bool:
     """Check if the aibot SDK is available."""
     return AIBOT_AVAILABLE
@@ -304,6 +309,10 @@ class WeComStreamAdapter(BasePlatformAdapter):
         self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
         self._on_message_intercepted = False
 
+        # IPC relay server state
+        self._ipc_task: Optional[asyncio.Task] = None
+        self._ipc_server = None
+
         # Media download directory for received images/files
         self._media_dir: Path = Path(
             os.getenv("WECOM_MEDIA_DIR") or "~/.hermes/media"
@@ -348,6 +357,12 @@ class WeComStreamAdapter(BasePlatformAdapter):
             self._mark_connected()
             self._listen_task = asyncio.create_task(self._sdk_run_loop())
             self._upload_lock = asyncio.Lock()
+
+            # Start IPC Unix socket server so standalone senders (hermes send,
+            # cron) can relay messages through this gateway adapter instead of
+            # creating their own WS connection (WeCom only allows one per bot).
+            self._ipc_task = asyncio.create_task(self._start_ipc_server())
+
             logger.info("[%s] Connected via aibot SDK to %s", self.name, self._ws_url)
             return True
         except Exception as exc:
@@ -360,6 +375,28 @@ class WeComStreamAdapter(BasePlatformAdapter):
         """Disconnect from WeCom."""
         self._running = False
         self._mark_disconnected()
+
+        # Stop IPC server
+        if hasattr(self, "_ipc_task") and self._ipc_task and not self._ipc_task.done():
+            self._ipc_task.cancel()
+            try:
+                await self._ipc_task
+            except asyncio.CancelledError:
+                pass
+            self._ipc_task = None
+        ipc_sock = getattr(self, "_ipc_server", None)
+        if ipc_sock:
+            try:
+                ipc_sock.close()
+            except Exception:
+                pass
+            self._ipc_server = None
+        ipc_path = _ipc_socket_path()
+        if ipc_path.exists():
+            try:
+                ipc_path.unlink()
+            except Exception:
+                pass
 
         if self._listen_task:
             self._listen_task.cancel()
@@ -406,6 +443,104 @@ class WeComStreamAdapter(BasePlatformAdapter):
             if self._running:
                 logger.warning("[%s] SDK run loop exited: %s", self.name, exc)
                 self._mark_disconnected()
+
+    # ------------------------------------------------------------------
+    # IPC Unix Socket Server (for standalone sender relay)
+    # ------------------------------------------------------------------
+
+    async def _start_ipc_server(self) -> None:
+        """Start a Unix socket server that accepts relay requests from
+        standalone senders (hermes send, cron).
+
+        Protocol: client connects, sends a JSON line with the request,
+        server responds with a JSON line containing the result, then
+        closes the connection.
+
+        Request: {"chat_id": "...", "message": "...", "media_files": [...]}
+        Response: {"success": true, ...} or {"error": "..."}
+        """
+        sock_path = _ipc_socket_path()
+        try:
+            sock_path.parent.mkdir(parents=True, exist_ok=True)
+            # Clean up stale socket
+            if sock_path.exists():
+                sock_path.unlink()
+
+            server = await asyncio.start_unix_server(
+                self._handle_ipc_client, str(sock_path)
+            )
+            self._ipc_server = server
+            logger.info("[%s] IPC server listening on %s", self.name, sock_path)
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[%s] IPC server failed to start: %s", self.name, exc)
+
+    async def _handle_ipc_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Handle a single IPC client connection."""
+        try:
+            data = await asyncio.wait_for(reader.read(1_000_000), timeout=30)
+            if not data:
+                return
+            request = json.loads(data)
+
+            chat_id = request.get("chat_id", "")
+            message = request.get("message", "")
+            media_files = request.get("media_files", [])  # list of [path, is_voice]
+
+            # Send media files first
+            for mf in media_files:
+                if isinstance(mf, (list, tuple)) and len(mf) >= 1:
+                    mf_path, is_voice = mf[0], bool(mf[1]) if len(mf) > 1 else False
+                elif isinstance(mf, str):
+                    mf_path, is_voice = mf, False
+                else:
+                    continue
+
+                media_type = "voice" if is_voice else _infer_media_type_standalone(mf_path)
+                result = await self.send_media(
+                    chat_id=chat_id, file_path=mf_path, media_type=media_type,
+                )
+                if not result.success:
+                    resp = json.dumps({"error": f"Media send failed: {result.error}"})
+                    writer.write(resp.encode())
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+            # Send text
+            if message and message.strip():
+                result = await self.send(chat_id=chat_id, content=message[:MAX_MESSAGE_LENGTH])
+                if not result.success:
+                    resp = json.dumps({"error": f"Send failed: {result.error}"})
+                    writer.write(resp.encode())
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+            resp = json.dumps({"success": True, "platform": "wecom_stream", "chat_id": chat_id})
+            writer.write(resp.encode())
+            await writer.drain()
+        except asyncio.TimeoutError:
+            resp = json.dumps({"error": "IPC request timed out"})
+            writer.write(resp.encode())
+            await writer.drain()
+        except Exception as exc:
+            resp = json.dumps({"error": str(exc)})
+            writer.write(resp.encode())
+            await writer.drain()
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Inbound message handling
@@ -1550,6 +1685,133 @@ class WeComStreamAdapter(BasePlatformAdapter):
 
 
 # ------------------------------------------------------------------
+# Standalone sender (out-of-process delivery for hermes send / cron)
+# ------------------------------------------------------------------
+
+async def _standalone_send(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[list] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Send a message by relaying through the gateway's IPC socket.
+
+    WeCom aibot only allows one WebSocket connection per bot, so standalone
+    senders (hermes send, cron) cannot create their own connection.  Instead,
+    the gateway adapter hosts a Unix socket IPC server; this function connects
+    to it and forwards the send request.
+
+    Falls back to direct WS connection when the IPC socket is unavailable
+    (gateway not running), which will fail with 846609 — but the error message
+    will be clear about the cause.
+    """
+    media_files = media_files or []
+    sock_path = _ipc_socket_path()
+
+    # --- Primary path: relay via gateway IPC socket ---
+    if sock_path.exists():
+        try:
+            loop = asyncio.get_running_loop()
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(str(sock_path)), timeout=5
+            )
+
+            request: Dict[str, Any] = {
+                "chat_id": chat_id,
+                "message": message or "",
+            }
+            if media_files:
+                request["media_files"] = [[str(p), bool(v)] for p, v in media_files]
+
+            writer.write(json.dumps(request).encode())
+            await writer.drain()
+
+            response_data = await asyncio.wait_for(reader.read(1_000_000), timeout=30)
+            writer.close()
+            await writer.wait_closed()
+
+            result = json.loads(response_data)
+            return result
+        except FileNotFoundError:
+            pass  # socket disappeared between exists check and connect
+        except asyncio.TimeoutError:
+            return {"error": "wecom_stream standalone: IPC connection timed out (gateway busy or not running)"}
+        except Exception as exc:
+            logger.debug("[wecom_stream:standalone] IPC relay failed: %s", exc)
+            # Fall through to direct attempt below
+
+    # --- Fallback: direct WS connection (will fail if gateway is running) ---
+    if not AIBOT_AVAILABLE:
+        return {
+            "error": (
+                "wecom_stream standalone send: gateway IPC socket not available "
+                f"({sock_path}) and aibot SDK not installed. "
+                "Ensure the gateway is running."
+            ),
+        }
+
+    extra = getattr(pconfig, "extra", {}) or {}
+    bot_id = str(extra.get("bot_id") or os.getenv("WECOM_STREAM_BOT_ID", "") or os.getenv("WECOM_BOT_ID", "")).strip()
+    secret = str(extra.get("secret") or os.getenv("WECOM_STREAM_SECRET", "") or os.getenv("WECOM_SECRET", "")).strip()
+
+    if not bot_id or not secret:
+        return {"error": "wecom_stream standalone send: bot_id or secret not configured"}
+
+    client = None
+    try:
+        options = WSClientOptions(
+            bot_id=bot_id,
+            secret=secret,
+            max_reconnect_attempts=0,
+        )
+        client = WSClient(options)
+        await client.connect()
+
+        if message and message.strip():
+            msg_body = {
+                "msgtype": "markdown",
+                "markdown": {"content": message[:MAX_MESSAGE_LENGTH]},
+            }
+            response = await client.send_message(chat_id, msg_body)
+            errcode = (response.get("body") or {}).get("errcode", 0) if isinstance(response, dict) else 0
+            if errcode:
+                errmsg = (response.get("body") or {}).get("errmsg", "unknown")
+                return {"error": f"wecom_stream standalone: send failed: errcode={errcode}: {errmsg}"}
+
+        return {"success": True, "platform": "wecom_stream", "chat_id": chat_id}
+
+    except Exception as e:
+        return {
+            "error": (
+                f"wecom_stream standalone send failed: {e}. "
+                "This usually means the gateway is not running — start it with "
+                f"`hermes gateway run` so the IPC socket ({sock_path}) is available."
+            ),
+        }
+    finally:
+        if client:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
+
+def _infer_media_type_standalone(file_path: str) -> str:
+    """Infer WeCom media type from file extension."""
+    ext = Path(file_path).suffix.lower()
+    if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"):
+        return "image"
+    if ext in (".mp3", ".amr", ".silk", ".wav", ".ogg"):
+        return "voice"
+    if ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+        return "video"
+    return "file"
+
+
+# ------------------------------------------------------------------
 # Plugin entry point
 # ------------------------------------------------------------------
 
@@ -1575,6 +1837,8 @@ def register(ctx) -> None:
         install_hint="pip install wecom-aibot-python-sdk",
         # Cron home-channel delivery
         cron_deliver_env_var="WECOM_HOME_CHANNEL",
+        # Out-of-process delivery (hermes send / cron standalone)
+        standalone_sender_fn=_standalone_send,
         # WeCom hard limit per message
         max_message_length=4000,
         # Display
