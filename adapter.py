@@ -323,7 +323,7 @@ class WeComStreamAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to WeCom via the aibot SDK."""
         if not AIBOT_AVAILABLE:
             message = "WeCom Stream startup failed: wecom-aibot-python-sdk not installed"
