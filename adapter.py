@@ -150,16 +150,93 @@ if AIBOT_AVAILABLE:
     _WsMgr._get_reconnect_delay = _get_reconnect_delay
     _WsMgr._schedule_reconnect = _patched_schedule_reconnect
     _WsMgr.connect = _patched_connect
-    logger.info("[Wecom_Stream] Patched aibot reconnection strategy: 3-phase (1s/60s/300s)")
+
+    # Issue #8: Verify patches took effect
+    _pw = []
+    if _WsMgr._get_reconnect_delay is not _get_reconnect_delay:
+        _pw.append("_get_reconnect_delay")
+    if _WsMgr._schedule_reconnect is not _patched_schedule_reconnect:
+        _pw.append("_schedule_reconnect")
+    if _WsMgr.connect is not _patched_connect:
+        _pw.append("connect")
+    if _pw:
+        logger.warning("[Wecom_Stream] SDK patch verification FAILED for: %s", ", ".join(_pw))
+    else:
+        logger.info("[Wecom_Stream] Patched aibot reconnection strategy: 3-phase (1s/60s/300s)")
 
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
 MAX_MESSAGE_LENGTH = 4000
 DEDUP_MAX_SIZE = 1000
 
+# Split threshold
+_SPLIT_THRESHOLD = 3800
+
+
+def split_text(text: str, max_len: int = _SPLIT_THRESHOLD) -> list[str]:
+    """Split text into chunks no longer than max_len, preserving formatting."""
+    if len(text) <= max_len:
+        return [text]
+
+    _fence_re = re.compile(r"^(`{3,}|~{3,})")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    fence_open = ""
+
+    def _flush():
+        nonlocal current, current_len, fence_open
+        body = "".join(current).rstrip("\n")
+        if fence_open:
+            body += "\n```"
+        if body.strip():
+            chunks.append(body)
+        current = []
+        current_len = 0
+
+    for line in text.split("\n"):
+        line_nl = line + "\n"
+        stripped = line.strip()
+        if _fence_re.match(stripped):
+            if current and current_len + len(line_nl) > max_len:
+                _flush()
+                if fence_open:
+                    reopen = fence_open + "\n"
+                    current.append(reopen)
+                    current_len = len(reopen)
+            fence_open = "" if fence_open else stripped
+            current.append(line_nl)
+            current_len += len(line_nl)
+            continue
+        if current and current_len + len(line_nl) > max_len:
+            _flush()
+            if fence_open:
+                reopen = fence_open + "\n"
+                current.append(reopen)
+                current_len = len(reopen)
+        if len(line_nl) > max_len:
+            if current:
+                _flush()
+            for k in range(0, len(line), max_len):
+                chunks.append(line[k:k + max_len])
+            continue
+        current.append(line_nl)
+        current_len += len(line_nl)
+    _flush()
+    return chunks if chunks else [text[:max_len]]
+
 # Streaming constants (inspired by QwenPaw)
 PROCESSING_TEXT = "\U0001f914 Thinking..."
 PROCESSING_REFRESH_INTERVAL = 18.0  # seconds; WeCom drops stream if idle > ~20s
 PROCESSING_MAX_DURATION = 180.0
+
+# Issue #15: Configurable processing text
+_PROCESSING_TEXT = os.getenv("WECOM_STREAM_PROCESSING_TEXT", PROCESSING_TEXT)
+
+# Issue #15: Thinking text is configurable via env var
+_PROCESSING_TEXT = os.getenv("WECOM_STREAM_PROCESSING_TEXT", PROCESSING_TEXT)
+
+# Issue #15: Thinking text is configurable via env var
+_PROCESSING_TEXT = os.getenv("WECOM_STREAM_PROCESSING_TEXT", PROCESSING_TEXT)
 
 # Media upload via WebSocket (WeCom aibot upload protocol)
 _UPLOAD_CMD_INIT = "aibot_upload_media_init"
@@ -298,6 +375,10 @@ class WeComStreamAdapter(BasePlatformAdapter):
         self._last_frames: Dict[str, Any] = {}
         # Monotonic counter to detect stale keepalive invocations
         self._keepalive_generation: Dict[str, int] = {}
+        # Issue #9: Per-chat lock for keepalive/send mutual exclusion
+        self._stream_locks: Dict[str, asyncio.Lock] = {}
+        # Issue #10: Last frame send_time for turn detection fallback
+        self._last_send_time: Dict[str, str] = {}
         # Per-chat turn counter — incremented by send_typing() on each new
         # user message.  is_reuse_live compares session._turn_id against
         # this to detect genuine new turns vs same-turn segment breaks.
@@ -322,6 +403,12 @@ class WeComStreamAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
+
+    def _get_stream_lock(self, chat_id: str) -> asyncio.Lock:
+        """Get or create the per-chat asyncio.Lock for stream operations."""
+        if chat_id not in self._stream_locks:
+            self._stream_locks[chat_id] = asyncio.Lock()
+        return self._stream_locks[chat_id]
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to WeCom via the aibot SDK."""
@@ -405,6 +492,9 @@ class WeComStreamAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._listen_task = None
+
+        # Issue #2: Flush all active stream sessions before disconnecting
+        await self._flush_pending_finishes()
 
         # Cancel all active typing keepalive tasks
         for chat_id, session in list(self._stream_sessions.items()):
@@ -660,6 +750,8 @@ class WeComStreamAdapter(BasePlatformAdapter):
         # the second call for a new turn and finalizing the first bubble
         # (which would leave an empty orphan bubble behind).
         self._turn_id[chat_id] = self._turn_id.get(chat_id, 0) + 1
+        # Issue #10: Store send_time for turn detection fallback
+        self._last_send_time[chat_id] = str(body.get("send_time") or "")
 
         # Eagerly show typing indicator before any batching delay —
         # the user sees "Thinking..." immediately, then real content
@@ -735,14 +827,13 @@ class WeComStreamAdapter(BasePlatformAdapter):
                 self._keepalive_generation[chat_id] = self._keepalive_generation.get(chat_id, 0) + 1
                 stream_id = session["stream_id"]
                 finish = False  # let deferred finish close it later
-                # Cancel the typing keepalive — we're now streaming real content.
-                # Note: cancelling an asyncio task does NOT abort an in-flight
-                # network call. The keepalive will check _keepalive_generation
-                # when it returns and won't do anything harmful.
+                # Cancel the typing keepalive
                 keepalive = session.get("keepalive_task")
                 if keepalive and not keepalive.done():
                     keepalive.cancel()
-                # Mark session as "streaming" (no longer typing) but still active
+                # Issue #9: wait for in-flight keepalive to release the lock
+                async with self._get_stream_lock(chat_id):
+                    pass
                 session["keepalive_task"] = None
                 session["is_typing"] = False
                 session["_prefix"] = ""  # first segment — no prefix
@@ -846,6 +937,12 @@ class WeComStreamAdapter(BasePlatformAdapter):
             # Track displayed content for cross-segment prefix on reuse.
             if session:
                 session["_displayed_content"] = full_content
+
+            # Critical: When streaming is disabled, gateway calls send() but
+            # never calls edit_message(). Schedule deferred finish here so
+            # finish=True gets sent after the turn ends.
+            if not finish and session and not session.get("finished"):
+                self._schedule_deferred_finish(session, stream_id, frame)
 
             return SendResult(
                 success=True,
@@ -990,23 +1087,23 @@ class WeComStreamAdapter(BasePlatformAdapter):
         # This ensures that multiple send_typing calls within the same
         # turn (adapter's eager call + gateway's _handle_message_with_agent
         # patch) share the same turn_id and are correctly deduped.
-        # DEBUG: log call stack to trace duplicate send_typing calls
-        import traceback
-        logger.info("[%s] send_typing CALLED for %s (turn %d)\n%s",
-                     self.name, chat_id, self._turn_id.get(chat_id, 0),
-                     "".join(traceback.format_stack()))
         existing = self._stream_sessions.get(chat_id)
         if existing and not existing.get("finished"):
             # If turn_id changed, the old bubble belongs to a previous turn
             # — finalize it and create a fresh typing session.
-            if existing.get("_turn_id", 0) != self._turn_id[chat_id]:
+            old_turn = existing.get("_turn_id", 0)
+            cur_turn = self._turn_id[chat_id]
+            old_st = existing.get("_send_time", "")
+            cur_st = self._last_send_time.get(chat_id, "")
+            is_new_turn = old_turn != cur_turn or (cur_st and old_st != cur_st)
+            if is_new_turn:
                 logger.info("[%s] send_typing NEW TURN (old turn %d != %d) — finalizing old session in %s",
                              self.name, existing.get("_turn_id", 0),
                              self._turn_id[chat_id], chat_id)
                 await self._finalize_old_session(chat_id, existing)
                 # Fall through to create new typing session below
             else:
-                logger.info("[%s] send_typing DEDUP SKIP in %s (is_typing=%s, finished=%s, turn %d)",
+                logger.debug("[%s] send_typing DEDUP SKIP in %s (is_typing=%s, finished=%s, turn %d)",
                              self.name, chat_id, existing.get("is_typing"),
                              existing.get("finished"), self._turn_id[chat_id])
                 return
@@ -1024,7 +1121,7 @@ class WeComStreamAdapter(BasePlatformAdapter):
             self._keepalive_generation[chat_id] = 0
 
             response = await self._client.reply_stream(
-                frame, stream_id=stream_id, content=PROCESSING_TEXT, finish=False,
+                frame, stream_id=stream_id, content=_PROCESSING_TEXT, finish=False,
             )
 
             error = self._response_error(response)
@@ -1043,8 +1140,9 @@ class WeComStreamAdapter(BasePlatformAdapter):
                 "finished": False,
                 "is_typing": True,
                 "_turn_id": self._turn_id.get(chat_id, 0),
+                "_send_time": self._last_send_time.get(chat_id, ""),
             }
-            logger.info("[%s] send_typing CREATED session in %s (stream_id=%s, turn %d)", self.name, chat_id, stream_id[:16], self._turn_id[chat_id])
+            logger.debug("[%s] send_typing CREATED session in %s (stream_id=%s, turn %d)", self.name, chat_id, stream_id[:16], self._turn_id[chat_id])
         except Exception as exc:
             logger.debug("[%s] send_typing failed: %s", self.name, exc)
 
@@ -1090,7 +1188,7 @@ class WeComStreamAdapter(BasePlatformAdapter):
                     logger.warning("[%s] Typing keepalive exceeded max duration for %s", self.name, chat_id)
                     try:
                         await self._client.reply_stream(
-                            frame, stream_id=stream_id, content=PROCESSING_TEXT, finish=True,
+                            frame, stream_id=stream_id, content=_PROCESSING_TEXT, finish=True,
                         )
                     except Exception:
                         pass
@@ -1102,10 +1200,14 @@ class WeComStreamAdapter(BasePlatformAdapter):
                 if self._keepalive_generation.get(chat_id, 0) != generation:
                     return
 
+                # Issue #9: hold per-chat lock during reply_stream
                 try:
-                    await self._client.reply_stream(
-                        frame, stream_id=stream_id, content=PROCESSING_TEXT, finish=False,
-                    )
+                    async with self._get_stream_lock(chat_id):
+                        if self._keepalive_generation.get(chat_id, 0) != generation:
+                            return
+                        await self._client.reply_stream(
+                            frame, stream_id=stream_id, content=_PROCESSING_TEXT, finish=False,
+                        )
                 except Exception as exc:
                     logger.debug("[%s] Keepalive refresh failed: %s", self.name, exc)
                     return
@@ -1149,22 +1251,32 @@ class WeComStreamAdapter(BasePlatformAdapter):
         logger.debug("[%s] WS message interceptor installed for upload acks", self.name)
 
     def _capture_ws_loop(self) -> Optional[asyncio.AbstractEventLoop]:
-        """Capture the SDK's internal event loop for cross-loop sends."""
-        if self._ws_loop:
+        """Capture the SDK event loop for cross-loop sends. Issue #7: 3-level fallback."""
+        if self._ws_loop and not self._ws_loop.is_closed():
             return self._ws_loop
-        # The SDK's WS manager runs tasks via asyncio.ensure_future in its loop.
-        # We can discover it from the WS manager's receive task.
         ws_mgr = getattr(self._client, "_ws_manager", None)
         if ws_mgr:
-            task = getattr(ws_mgr, "_receive_task", None)
-            if task and hasattr(task, "get_loop"):
-                self._ws_loop = task.get_loop()
-                return self._ws_loop
-            # Fallback: try heartbeat task
-            task = getattr(ws_mgr, "_heartbeat_task", None)
-            if task and hasattr(task, "get_loop"):
-                self._ws_loop = task.get_loop()
-                return self._ws_loop
+            for attr in ("_receive_task", "_heartbeat_task", "_reconnect_task"):
+                task = getattr(ws_mgr, attr, None)
+                if task and hasattr(task, "get_loop"):
+                    try:
+                        loop = task.get_loop()
+                        if not loop.is_closed():
+                            self._ws_loop = loop
+                            return loop
+                    except Exception:
+                        pass
+        for attr in ("_loop", "_event_loop"):
+            loop = getattr(self._client, attr, None)
+            if loop and isinstance(loop, asyncio.AbstractEventLoop) and not loop.is_closed():
+                self._ws_loop = loop
+                return loop
+        try:
+            loop = asyncio.get_running_loop()
+            if not loop.is_closed():
+                return loop
+        except RuntimeError:
+            pass
         return None
 
     async def _send_ws_cmd(
@@ -1315,6 +1427,25 @@ class WeComStreamAdapter(BasePlatformAdapter):
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
+        # Issue #12: Finalize active stream before sending media
+        session = self._stream_sessions.get(chat_id)
+        if session and not session.get("finished"):
+            dft = session.get("_deferred_finish_task")
+            if dft and not dft.done():
+                dft.cancel()
+                session["_deferred_finish_task"] = None
+            sid = session.get("stream_id")
+            sframe = session.get("frame")
+            if sid and sframe and self._client:
+                try:
+                    await self._client.reply_stream(
+                        sframe, stream_id=sid,
+                        content=session.get("_displayed_content", ""), finish=True,
+                    )
+                except Exception:
+                    logger.debug("[%s] Pre-media finalize failed", self.name, exc_info=True)
+            session["finished"] = True
+
         media_id = await self._upload_media(file_path, media_type)
         if not media_id:
             return SendResult(success=False, error="Media upload failed")
@@ -1350,6 +1481,33 @@ class WeComStreamAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _DEFERRED_FINISH_DELAY = 3.0  # seconds after last edit before sending finish=True
+    _DEFERRED_FINISH_RETRIES = 3  # max retry attempts for finish=True
+    _DEFERRED_FINISH_RETRY_DELAY = 1.0  # base delay between retries
+
+    async def _flush_pending_finishes(self) -> None:
+        """Issue #2: Flush finish=True for all active sessions on disconnect."""
+        if not self._client:
+            return
+        for chat_id, session in list(self._stream_sessions.items()):
+            if session.get("finished"):
+                continue
+            dft = session.get("_deferred_finish_task")
+            if dft and not dft.done():
+                dft.cancel()
+                session["_deferred_finish_task"] = None
+            sid = session.get("stream_id")
+            frame = session.get("frame")
+            if not sid or not frame:
+                continue
+            try:
+                await self._client.reply_stream(
+                    frame, stream_id=sid,
+                    content=session.get("_displayed_content", ""), finish=True,
+                )
+                session["finished"] = True
+            except Exception as exc:
+                logger.warning("[%s] Flush finish failed for %s: %s", self.name, sid[:20], exc)
+                session["finished"] = True
 
     def _schedule_deferred_finish(
         self,
@@ -1379,26 +1537,42 @@ class WeComStreamAdapter(BasePlatformAdapter):
         stream_id: str,
         frame: Dict[str, Any],
     ) -> None:
-        """Send finish=True after a delay, unless cancelled by a new edit."""
+        """Send finish=True after delay, with retries. Issues #1/#3."""
         try:
             await asyncio.sleep(self._DEFERRED_FINISH_DELAY)
         except asyncio.CancelledError:
             return
         if session.get("finished"):
             return
-        logger.debug("[%s] Deferred finish for stream_id=%s", self.name, stream_id[:20])
-        # Send the last displayed content with finish=True so WeCom
-        # shows the final text (not an empty bubble).
         last_content = session.get("_displayed_content", "")
-        try:
-            await self._client.reply_stream(frame, stream_id=stream_id, content=last_content, finish=True)
-            session["finished"] = True
-            task = session.get("keepalive_task")
-            if task and not task.done():
-                task.cancel()
-        except Exception:
-            logger.warning("[%s] Deferred finish FAILED for stream_id=%s — session will stay finished=False!",
-                            self.name, stream_id[:20], exc_info=True)
+        max_attempts = max(1, self._DEFERRED_FINISH_RETRIES)
+        for attempt in range(1, max_attempts + 1):
+            if session.get("finished"):
+                return
+            try:
+                await self._client.reply_stream(
+                    frame, stream_id=stream_id, content=last_content, finish=True,
+                )
+                session["finished"] = True
+                task = session.get("keepalive_task")
+                if task and not task.done():
+                    task.cancel()
+                return
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                if attempt < max_attempts:
+                    delay = self._DEFERRED_FINISH_RETRY_DELAY * (2 ** (attempt - 1))
+                    logger.warning("[%s] Deferred finish attempt %d failed: %s - retry in %.1fs",
+                                   self.name, attempt, exc, delay)
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        return
+                else:
+                    logger.error("[%s] Deferred finish FAILED after %d attempts: %s",
+                                 self.name, max_attempts, exc)
+        session["finished"] = True
 
     async def _finalize_old_session(
         self, chat_id: str, session: Dict[str, Any],
@@ -1439,25 +1613,25 @@ class WeComStreamAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _proactive_send(self, chat_id: str, content: str) -> SendResult:
-        """Send a proactive message using send_message (no reply context).
-
-        Used as fallback when no inbound frame is available (e.g. cron delivery).
-        """
+        """Send a proactive message. Issue #5/#11: split + smart msgtype."""
         try:
-            response = await self._client.send_message(
-                chat_id,
-                {
-                    "msgtype": "markdown",
-                    "markdown": {"content": content[:MAX_MESSAGE_LENGTH]},
-                },
-            )
-            error = self._response_error(response)
-            if error:
-                return SendResult(success=False, error=error)
+            chunks = split_text(content)
+            last_result = None
+            for chunk in chunks:
+                has_md = any(c in chunk for c in ("**", "##", "|", "```", "- ", "1. "))
+                if has_md:
+                    msg_body = {"msgtype": "markdown", "markdown": {"content": chunk}}
+                else:
+                    msg_body = {"msgtype": "text", "text": {"content": chunk}}
+                response = await self._client.send_message(chat_id, msg_body)
+                last_result = response
+                error = self._response_error(response)
+                if error:
+                    return SendResult(success=False, error=error)
             return SendResult(
                 success=True,
-                message_id=str(response.get("headers", {}).get("req_id") or uuid.uuid4().hex[:12]),
-                raw_response=response,
+                message_id=str((last_result or {}).get("headers", {}).get("req_id") or uuid.uuid4().hex[:12]),
+                raw_response=last_result,
             )
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
