@@ -163,3 +163,18 @@ stream 永远停留在 `finish=False` 状态。企业微信客户端不为 `fini
 ## 未在本轮修复的问题
 
 - **#13 [Low]**: 单文件拆分为模块 — 需要补充 media upload / IPC 的集成测试后再做，风险较高。
+
+---
+
+## Issue #14 [Critical]: SDK run_forever 线程导致 gateway 重启挂死
+
+**Symptom**: `hermes gateway restart` 在 "Stopping gateway — draining in-flight runs" 处卡住直至 CLI 预算（1845s）耗尽。网关日志显示 drain 与 teardown 全部正常完成（<1s），但进程不退出。
+
+**根因**: `_sdk_run_loop` 把 `WSClient.run()`（内部 `loop.run_forever()` 永不返回）提交到 gateway 主循环的 default executor；SDK 的 `disconnect()` 只关 WebSocket 不停循环，线程永远存活。进程退出阶段 `asyncio.run()` 的 `shutdown_default_executor()` join 该 worker → 永久阻塞。
+
+**Fix**:
+- `_sdk_run_blocking()`: 复刻 SDK `run()`（connect + run_forever），但持有 loop 引用到 `self._sdk_loop`
+- `_sdk_run_loop()`: 改为专用 daemon 线程（不再占用 default executor）
+- `disconnect()`: `call_soon_threadsafe(loop.stop)` 停止 SDK 循环并 join 线程（5s 超时，daemon 兜底不阻塞进程退出）
+
+**Test**: `TestSdkLoopShutdown::test_disconnect_stops_sdk_loop_thread`

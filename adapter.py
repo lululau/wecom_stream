@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time as _time
 import uuid
 from datetime import datetime, timezone
@@ -357,7 +358,8 @@ class WeComStreamAdapter(BasePlatformAdapter):
 
         # aibot SDK client
         self._client: Optional["WSClient"] = None
-        self._sdk_thread: Optional[_time.monotonic] = None  # track SDK thread
+        self._sdk_thread: Optional[threading.Thread] = None  # SDK run_forever thread
+        self._sdk_loop: Optional[asyncio.AbstractEventLoop] = None
         self._listen_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
@@ -515,24 +517,102 @@ class WeComStreamAdapter(BasePlatformAdapter):
                 logger.debug("[%s] SDK disconnect error: %s", self.name, exc)
             self._client = None
 
+        # Stop the SDK's dedicated loop so run_forever() returns and the
+        # runner thread can be joined — otherwise the thread survives every
+        # disconnect and the process hangs at exit when asyncio.run shuts
+        # down its executors (gateway restart stuck at "draining").
+        sdk_loop = self._sdk_loop
+        self._sdk_loop = None
+        if sdk_loop is not None and sdk_loop.is_running():
+            try:
+                sdk_loop.call_soon_threadsafe(sdk_loop.stop)
+            except RuntimeError:
+                pass  # loop already closed from its own thread
+        sdk_thread = self._sdk_thread
+        self._sdk_thread = None
+        if sdk_thread is not None and sdk_thread.is_alive():
+            sdk_thread.join(timeout=5.0)
+            if sdk_thread.is_alive():
+                # Daemon thread: interpreter exit never waits on it, so this
+                # degrades to a leaked thread, not a hung shutdown.
+                logger.warning(
+                    "[%s] SDK loop thread still alive after 5s "
+                    "(daemon; process exit unaffected)",
+                    self.name,
+                )
+
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _sdk_run_loop(self) -> None:
-        """Keep the SDK\'s internal event loop alive.
+        """Keep the SDK's internal event loop alive on a dedicated thread.
 
-        The aibot SDK\'s run() is blocking. We run it in an executor
-        and handle reconnection internally via the SDK\'s built-in
-        reconnect logic (max_reconnect_attempts=-1 = infinite).
+        The aibot SDK's run() ends in a ``run_forever()`` that only returns
+        when someone stops its loop externally. It must NOT run on the
+        gateway loop's default executor: ``asyncio.run`` joins the default
+        executor during process exit, and a worker parked in ``run_forever()``
+        made every gateway restart hang until the CLI's kill budget expired.
+        A dedicated daemon thread (with the loop reference kept on the
+        adapter) is stopped from :meth:`disconnect` instead.
         """
+        if self._sdk_loop is not None and self._sdk_loop.is_running():
+            # Defensive: a previous runner is still alive (reconnect without
+            # an intervening disconnect) — stop it before replacing it.
+            try:
+                self._sdk_loop.call_soon_threadsafe(self._sdk_loop.stop)
+            except RuntimeError:
+                pass  # loop already closed from its own thread
+        thread = threading.Thread(
+            target=self._sdk_run_blocking, name="wecom-stream-sdk", daemon=True
+        )
+        self._sdk_thread = thread
+        thread.start()
         try:
-            await self._loop.run_in_executor(None, self._client.run)
+            # Supervise the thread so the awaiting task stays pending (and
+            # cancellable) for as long as the SDK loop runs, mirroring the
+            # previous executor-future semantics.
+            while thread.is_alive():
+                await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             return
+
+    def _sdk_run_blocking(self) -> None:
+        """Mirror ``WSClient.run()`` on a loop the adapter can stop.
+
+        The SDK's own run() creates the loop as a local variable and offers
+        no handle to end ``run_forever()`` from the outside; replicating it
+        keeps ``self._sdk_loop`` authoritative so disconnect can stop it.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._sdk_loop = loop
+        try:
+            loop.run_until_complete(self._client.connect())
+            loop.run_forever()
         except Exception as exc:
             if self._running:
                 logger.warning("[%s] SDK run loop exited: %s", self.name, exc)
-                self._mark_disconnected()
+                gw_loop = self._loop
+                try:
+                    if gw_loop is not None and gw_loop.is_running():
+                        gw_loop.call_soon_threadsafe(self._mark_disconnected)
+                    else:
+                        self._mark_disconnected()
+                except Exception:
+                    pass
+        finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception:
+                pass
+            asyncio.set_event_loop(None)
+            loop.close()
 
     # ------------------------------------------------------------------
     # IPC Unix Socket Server (for standalone sender relay)

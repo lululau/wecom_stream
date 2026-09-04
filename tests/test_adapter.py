@@ -1154,3 +1154,45 @@ class TestWSLoopCapture:
         # so the method returns None — but at least it won't return the closed loop
         result = adapter._capture_ws_loop()
         assert result is not closed_loop
+
+
+class TestSdkLoopShutdown:
+    """Regression: the SDK run_forever() thread must be stoppable.
+
+    The aibot SDK's run() ends in run_forever() and never returns on its
+    own. When it ran on the gateway loop's default executor, asyncio.run's
+    shutdown_default_executor joined that worker at process exit and every
+    `hermes gateway restart` hung until the CLI's kill budget expired.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disconnect_stops_sdk_loop_thread(self, adapter):
+        class FakeClient:
+            def __init__(self):
+                self.disconnect_calls = 0
+
+            async def connect(self):
+                return True
+
+            def disconnect(self):
+                self.disconnect_calls += 1
+
+        adapter._client = FakeClient()
+        adapter._running = True
+        adapter._listen_task = asyncio.create_task(adapter._sdk_run_loop())
+
+        deadline = asyncio.get_running_loop().time() + 5
+        while adapter._sdk_loop is None and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+
+        thread = adapter._sdk_thread
+        assert adapter._sdk_loop is not None, "SDK loop reference never set"
+        assert thread is not None and thread.is_alive()
+        assert thread.daemon is True, "runner thread must not block interpreter exit"
+
+        await adapter.disconnect()
+
+        assert adapter._sdk_loop is None
+        assert adapter._sdk_thread is None
+        assert not thread.is_alive(), "disconnect must join the SDK loop thread"
+        assert adapter._client is None
