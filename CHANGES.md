@@ -93,13 +93,17 @@ stream 永远停留在 `finish=False` 状态。企业微信客户端不为 `fini
 
 ---
 
-## Issue #11 [Medium]: proactive send 硬编码 markdown 类型
+## Issue #11 [Medium]: proactive send 硬编码 markdown 类型（已回滚）
 
-**Symptom**: `_proactive_send` 总是用 `msgtype: "markdown"`，纯文本消息也会
-被渲染为 markdown，可能导致显示不一致。
+**原改动**: 按内容检测 markdown 语法，纯文本改用 `msgtype: "text"`。
 
-**Fix**: 自动检测内容是否包含 markdown 语法（`**`, `##`, `|`, ` ``` `, `- `, `1. `），
-有则用 markdown 类型，否则用 text 类型。
+**回滚原因**: 企业微信智能机器人主动推送（`aibot_send_msg`）只接受
+`markdown` / `template_card` / 媒体；`text` 会返回 `errcode=40008
+invalid message type`。纯文本说明、启动通知、`hermes send` 无 frame
+路径全部失败。
+
+**现行行为**: `_proactive_send` 一律使用 `msgtype: "markdown"`（纯文本
+作为 markdown content 发送，合法且可显示）。
 
 ---
 

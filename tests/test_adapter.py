@@ -747,25 +747,29 @@ class TestProactiveSend:
         args = adapter._client.send_message.call_args
         body = args[0][1] if len(args[0]) > 1 else args[1]
         assert body["msgtype"] == "markdown"
+        assert body["markdown"]["content"] == "**Bold** text"
 
     @pytest.mark.asyncio
-    async def test_proactive_send_uses_text_for_plain(self, adapter):
-        """_proactive_send should use text type for plain content (Issue #11)."""
+    async def test_proactive_send_uses_markdown_for_plain(self, adapter):
+        """Proactive aibot_send_msg rejects msgtype=text (40008); plain text must be markdown."""
         result = await adapter._proactive_send("chat_001", "Hello plain text!")
         assert result.success is True
         args = adapter._client.send_message.call_args
         body = args[0][1] if len(args[0]) > 1 else args[1]
-        assert body["msgtype"] == "text"
+        assert body["msgtype"] == "markdown"
+        assert body["markdown"]["content"] == "Hello plain text!"
+        assert "text" not in body
 
     @pytest.mark.asyncio
     async def test_proactive_send_truncates(self, adapter):
         """_proactive_send should split long text into chunks, each <= MAX_MESSAGE_LENGTH."""
-        long_text = "**B**\n" * (MAX_MESSAGE_LENGTH + 100)  # markdown to force markdown type
+        long_text = "B\n" * (MAX_MESSAGE_LENGTH + 100)
         result = await adapter._proactive_send("chat_001", long_text)
         assert result.success is True
         for call in adapter._client.send_message.call_args_list:
             body = call[0][1] if len(call[0]) > 1 else {}
-            content = body.get("markdown", {}).get("content", "") or body.get("text", {}).get("content", "")
+            assert body["msgtype"] == "markdown"
+            content = body.get("markdown", {}).get("content", "")
             assert len(content) <= MAX_MESSAGE_LENGTH
 
 

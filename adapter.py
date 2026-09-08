@@ -663,6 +663,7 @@ class WeComStreamAdapter(BasePlatformAdapter):
             media_files = request.get("media_files", [])  # list of [path, is_voice]
 
             # Send media files first
+            media_delivered = 0
             for mf in media_files:
                 if isinstance(mf, (list, tuple)) and len(mf) >= 1:
                     mf_path, is_voice = mf[0], bool(mf[1]) if len(mf) > 1 else False
@@ -682,19 +683,38 @@ class WeComStreamAdapter(BasePlatformAdapter):
                     writer.close()
                     await writer.wait_closed()
                     return
+                media_delivered += 1
 
-            # Send text
+            # Send text after media. If media already landed and text fails,
+            # treat as success with a warning — returning error here causes
+            # callers (hermes send / agents) to retry and duplicate attachments.
+            text_warning = None
             if message and message.strip():
                 result = await self.send(chat_id=chat_id, content=message[:MAX_MESSAGE_LENGTH])
                 if not result.success:
-                    resp = json.dumps({"error": f"Send failed: {result.error}"})
-                    writer.write(resp.encode())
-                    await writer.drain()
-                    writer.close()
-                    await writer.wait_closed()
-                    return
+                    if media_delivered > 0:
+                        text_warning = result.error or "text send failed"
+                        logger.warning(
+                            "[%s] IPC text send failed after %s media delivered: %s",
+                            self.name, media_delivered, text_warning,
+                        )
+                    else:
+                        resp = json.dumps({"error": f"Send failed: {result.error}"})
+                        writer.write(resp.encode())
+                        await writer.drain()
+                        writer.close()
+                        await writer.wait_closed()
+                        return
 
-            resp = json.dumps({"success": True, "platform": "wecom_stream", "chat_id": chat_id})
+            resp_body: Dict[str, Any] = {
+                "success": True,
+                "platform": "wecom_stream",
+                "chat_id": chat_id,
+            }
+            if text_warning:
+                resp_body["warning"] = f"media delivered; text failed: {text_warning}"
+                resp_body["media_delivered"] = media_delivered
+            resp = json.dumps(resp_body)
             writer.write(resp.encode())
             await writer.drain()
         except asyncio.TimeoutError:
@@ -1693,16 +1713,18 @@ class WeComStreamAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _proactive_send(self, chat_id: str, content: str) -> SendResult:
-        """Send a proactive message. Issue #5/#11: split + smart msgtype."""
+        """Send a proactive message via aibot_send_msg.
+
+        Always uses ``msgtype: markdown``. The WeCom AI Bot proactive API
+        accepts markdown / template_card / media only — ``text`` returns
+        errcode 40008 (invalid message type). Plain prose is still valid
+        markdown content.
+        """
         try:
             chunks = split_text(content)
             last_result = None
             for chunk in chunks:
-                has_md = any(c in chunk for c in ("**", "##", "|", "```", "- ", "1. "))
-                if has_md:
-                    msg_body = {"msgtype": "markdown", "markdown": {"content": chunk}}
-                else:
-                    msg_body = {"msgtype": "text", "text": {"content": chunk}}
+                msg_body = {"msgtype": "markdown", "markdown": {"content": chunk}}
                 response = await self._client.send_message(chat_id, msg_body)
                 last_result = response
                 error = self._response_error(response)
