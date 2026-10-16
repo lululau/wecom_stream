@@ -9,6 +9,8 @@ description: >
   Reuses the same WECOM_BOT_ID / WECOM_SECRET as the built-in wecom
   adapter — just enable this platform and disable wecom to switch.
 author: Hermes Agent contributors
+python_dependencies:
+  - "wecom-aibot-python-sdk>=1.0.0,<2"
 requires_env:
   - name: WECOM_BOT_ID
     description: "WeCom AI Bot ID"
